@@ -13,7 +13,7 @@
 .env
 .env.*
 !.env.example
-
+.testing.pem
 # --- Application code (deployed FROM here, not stored here) -------------------
 # Separate projects with their own git remotes; this repo is the deploy tooling.
 nextjs/
