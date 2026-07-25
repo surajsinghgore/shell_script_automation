@@ -1,0 +1,21 @@
+# Shell scripts MUST keep LF line endings.
+# This repo is authored on Windows (core.autocrlf=true) but the scripts run in
+# Git Bash and on the Ubuntu server. A CRLF shebang line makes bash fail with
+#     ./react-develop.sh: line 1: $'\r': command not found
+# so pin them regardless of anyone's local git config.
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Docs and config read fine either way, but keeping them LF avoids
+# whole-file diffs whenever they are edited on a different platform.
+*.md         text eol=lf
+.gitignore   text eol=lf
+.gitattributes text eol=lf
+
+# Never touched by line-ending conversion.
+*.pem   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary

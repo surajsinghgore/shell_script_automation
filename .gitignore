@@ -1,0 +1,44 @@
+# ==============================================================================
+#  shell_script_automation — what must never reach GitHub
+# ==============================================================================
+
+# --- Secrets ------------------------------------------------------------------
+# deploy.conf / react-develop.conf hold a GitHub PAT in plaintext, and *.pem is
+# an SSH private key. Either one in a public repo is game over.
+*.conf
+*.conf.bak
+*.bak
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# --- Application code (deployed FROM here, not stored here) -------------------
+# Separate projects with their own git remotes; this repo is the deploy tooling.
+nextjs/
+reactjs/
+
+# --- Build / dependency noise -------------------------------------------------
+node_modules/
+dist/
+build/
+out/
+.next/
+*.tsbuildinfo
+
+# --- OS / editor --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
+
+# --- Logs ---------------------------------------------------------------------
+*.log
+npm-debug.log*
+react-develop.main.conf
+react-develop.develop.conf
+react-develop.main.conf
+react-develop.develop.conf
