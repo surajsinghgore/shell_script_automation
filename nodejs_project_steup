@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  deploy.sh — Vercel-style one-command deploy for Node.js apps on a VPS/EC2.
+#
+#  Runs FROM YOUR LAPTOP. Talks to the server over SSH using your .pem key.
+#
+#  Usage:
+#     ./deploy.sh setup     # first time: asks everything, installs full stack
+#     ./deploy.sh deploy    # every update after that: pull -> build -> reload
+#     ./deploy.sh ssl       # issue/renew HTTPS cert for your domain
+#     ./deploy.sh env       # upload local .env to the server, then restart
+#     ./deploy.sh logs      # tail live app logs
+#     ./deploy.sh status    # pm2 + nginx health
+#     ./deploy.sh restart   # restart app
+#     ./deploy.sh ssh       # drop into a shell on the server
+#     ./deploy.sh config    # re-run the questions / edit answers
+#
+#  Answers are cached in ./deploy.conf (chmod 600) so you only answer once.
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/deploy.conf}"
+
+# ------------------------------- pretty output --------------------------------
+C_B=$'\033[36m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_D=$'\033[2m'; C_0=$'\033[0m'
+step() { printf '\n%s==>%s %s\n' "$C_B" "$C_0" "$*"; }
+ok()   { printf '%s  ✓%s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '%s  !%s %s\n' "$C_Y" "$C_0" "$*"; }
+die()  { printf '%s  ✗%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+note() { printf '%s    %s%s\n' "$C_D" "$*" "$C_0"; }
+
+# ------------------------------- config defaults ------------------------------
+PEM_PATH=""          # /path/to/key.pem
+SERVER_HOST=""       # EC2 public IP or DNS
+SSH_USER="ubuntu"    # ubuntu (Ubuntu AMI) / ec2-user (Amazon Linux) / root
+NODE_MAJOR="22"
+REPO_URL=""          # https://github.com/user/repo.git
+REPO_PRIVATE="y"
+GIT_USER=""          # github username (only needed for private repos)
+GIT_TOKEN=""         # github personal access token (repo:read scope)
+GIT_BRANCH="main"
+APP_NAME="myapp"
+APP_DIR=""           # /home/ubuntu/apps/<APP_NAME>
+APP_PORT="3000"
+INSTALL_CMD="npm ci --omit=dev || npm install --omit=dev"
+BUILD_CMD=""         # e.g. "npm run build" — leave blank to auto-detect
+START_CMD="npm start"
+ENV_FILE=""          # local path to your production env file (blank = auto-detect .env.production/.env)
+DOMAIN=""            # example.com   (blank = access by IP only)
+WWW_ALIAS="y"
+SSL_EMAIL=""
+SETUP_FIREWALL="y"
+
+CONFIG_KEYS=(PEM_PATH SERVER_HOST SSH_USER NODE_MAJOR REPO_URL REPO_PRIVATE GIT_USER
+             GIT_TOKEN GIT_BRANCH APP_NAME APP_DIR APP_PORT INSTALL_CMD BUILD_CMD
+             START_CMD ENV_FILE DOMAIN WWW_ALIAS SSL_EMAIL SETUP_FIREWALL)
+
+load_config() { [[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE" || true; }
+
+save_config() {
+  : > "$CONFIG_FILE"; chmod 600 "$CONFIG_FILE"
+  {
+    echo "# deploy.sh config — contains a git token. NEVER commit this file."
+    for k in "${CONFIG_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k}"; done
+  } >> "$CONFIG_FILE"
+  ok "Saved answers to $CONFIG_FILE (chmod 600)"
+  if [[ -d "$SCRIPT_DIR/.git" ]] && ! grep -qs '^deploy.conf$' "$SCRIPT_DIR/.gitignore" 2>/dev/null; then
+    echo "deploy.conf" >> "$SCRIPT_DIR/.gitignore"; note "added deploy.conf to .gitignore"
+  fi
+}
+
+ask() {  # ask VAR "Question" ["default"]
+  local var="$1" prompt="$2" def="${3:-}" cur ans
+  cur="${!var:-}"; [[ -n "$cur" ]] && def="$cur"
+  if [[ -n "$def" ]]; then read -r -p "  $prompt [$def]: " ans; else read -r -p "  $prompt: " ans; fi
+  printf -v "$var" '%s' "${ans:-$def}"
+}
+
+ask_secret() {  # ask_secret VAR "Question"
+  local var="$1" prompt="$2" ans cur="${!var:-}"
+  if [[ -n "$cur" ]]; then
+    read -r -p "  $prompt [keep existing, press Enter]: " -s ans; echo
+    [[ -n "$ans" ]] && printf -v "$var" '%s' "$ans"
+  else
+    read -r -p "  $prompt: " -s ans; echo
+    printf -v "$var" '%s' "$ans"
+  fi
+}
+
+# ------------------------------- ssh plumbing ---------------------------------
+init_ssh() {
+  [[ -n "$PEM_PATH" && -f "$PEM_PATH" ]] || die "PEM key not found: '$PEM_PATH'. Run: ./deploy.sh config"
+  chmod 600 "$PEM_PATH" 2>/dev/null || true
+  SSH_OPTS=(-i "$PEM_PATH" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
+            -o ServerAliveInterval=30 -o LogLevel=ERROR)
+}
+
+# Runs a script (from stdin) on the server with our config exported as env vars.
+remote() {
+  local envs=""
+  for k in APP_NAME APP_DIR APP_PORT NODE_MAJOR REPO_URL GIT_BRANCH GIT_USER GIT_TOKEN \
+           INSTALL_CMD BUILD_CMD START_CMD DOMAIN WWW_ALIAS SSL_EMAIL SSH_USER SETUP_FIREWALL; do
+    envs+="$k=$(printf '%q' "${!k}") "
+  done
+  ssh "${SSH_OPTS[@]}" "$SSH_USER@$SERVER_HOST" "$envs bash -s" || return $?
+}
+
+remote_tty() { ssh -t "${SSH_OPTS[@]}" "$SSH_USER@$SERVER_HOST" "$@"; }
+
+# ------------------------------- the wizard -----------------------------------
+wizard() {
+  cat <<'BANNER'
+
+  ┌──────────────────────────────────────────────┐
+  │   Node.js  ->  VPS   deployment setup        │
+  └──────────────────────────────────────────────┘
+BANNER
+
+  step "1/6  Server access"
+  ask PEM_PATH    "Path to your .pem key"
+  PEM_PATH="${PEM_PATH/#\~/$HOME}"
+  ask SERVER_HOST "Server public IP or DNS"
+  ask SSH_USER    "SSH user (ubuntu | ec2-user | root)"
+
+  step "2/6  Git repository"
+  ask REPO_URL    "Repo HTTPS URL (https://github.com/you/repo.git)"
+  ask REPO_PRIVATE "Is the repo private? (y/n)"
+  if [[ "$REPO_PRIVATE" =~ ^[Yy] ]]; then
+    ask GIT_USER   "GitHub username"
+    ask_secret GIT_TOKEN "GitHub token (PAT with 'repo' / Contents:Read)"
+    [[ -n "$GIT_TOKEN" ]] || die "A token is required for a private repo."
+  else
+    GIT_USER=""; GIT_TOKEN=""
+  fi
+  ask GIT_BRANCH  "Branch to deploy"
+
+  step "3/6  Application"
+  local guess; guess="$(basename -s .git "${REPO_URL:-app}")"
+  [[ "$APP_NAME" == "myapp" && -n "$guess" ]] && APP_NAME="$guess"
+  ask APP_NAME    "App name (pm2 process name)"
+  ask APP_PORT    "Port your app listens on"
+  ask NODE_MAJOR  "Node.js major version"
+  ask INSTALL_CMD "Install command"
+  ask BUILD_CMD   "Build command (blank = auto-detect 'npm run build')"
+  ask START_CMD   "Start command"
+  ask ENV_FILE    "Local env file to upload (blank = auto-detect .env.production / .env)"
+  ENV_FILE="${ENV_FILE/#\~/$HOME}"
+  APP_DIR="/home/$SSH_USER/apps/$APP_NAME"
+  [[ "$SSH_USER" == "root" ]] && APP_DIR="/root/apps/$APP_NAME"
+  note "App will live in $APP_DIR"
+
+  step "4/6  Nginx + domain"
+  ask DOMAIN      "Domain (blank = serve on IP only)"
+  if [[ -n "$DOMAIN" ]]; then
+    ask WWW_ALIAS "Also serve www.$DOMAIN? (y/n)"
+    step "5/6  HTTPS"
+    ask SSL_EMAIL "Email for Let's Encrypt (blank = skip HTTPS for now)"
+  fi
+
+  step "6/6  Firewall"
+  ask SETUP_FIREWALL "Enable UFW firewall (22/80/443 only)? (y/n)"
+
+  save_config
+}
+
+# ------------------------------- preflight ------------------------------------
+preflight() {
+  step "Checking connection to $SSH_USER@$SERVER_HOST"
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$SSH_USER@$SERVER_HOST" 'echo connected' >/dev/null 2>&1 \
+    || die "SSH failed. Check: key path, security group allows port 22 from your IP, correct user ($SSH_USER)."
+  ok "SSH works"
+  remote <<'REMOTE' || die "Passwordless sudo is not available for $SSH_USER."
+sudo -n true 2>/dev/null
+REMOTE
+  ok "sudo works"
+}
+
+# ------------------------------- provision ------------------------------------
+provision() {
+  step "Installing system stack (node $NODE_MAJOR, pm2, nginx, certbot, git)"
+  remote <<'REMOTE'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+echo "--- apt update"
+sudo apt-get update -y -qq
+sudo apt-get install -y -qq curl git ca-certificates gnupg build-essential ufw
+
+if ! command -v node >/dev/null 2>&1 || [ "$(node -v | cut -d. -f1)" != "v${NODE_MAJOR}" ]; then
+  echo "--- installing Node.js ${NODE_MAJOR}.x"
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash - >/dev/null
+  sudo apt-get install -y -qq nodejs
+fi
+echo "node $(node -v) / npm $(npm -v)"
+
+if ! command -v pm2 >/dev/null 2>&1; then
+  echo "--- installing pm2"
+  sudo npm install -g pm2@latest --silent
+fi
+
+# make pm2 survive reboots
+sudo env PATH="$PATH:/usr/bin" "$(command -v pm2)" startup systemd -u "$USER" --hp "$HOME" >/dev/null
+
+if ! command -v nginx >/dev/null 2>&1; then
+  echo "--- installing nginx"
+  sudo apt-get install -y -qq nginx
+  sudo systemctl enable --now nginx
+fi
+
+if ! command -v certbot >/dev/null 2>&1; then
+  echo "--- installing certbot"
+  sudo apt-get install -y -qq certbot python3-certbot-nginx
+fi
+
+if [ "${SETUP_FIREWALL:-n}" = "y" ] || [ "${SETUP_FIREWALL:-n}" = "Y" ]; then
+  echo "--- firewall"
+  sudo ufw allow OpenSSH >/dev/null
+  sudo ufw allow 'Nginx Full' >/dev/null
+  sudo ufw --force enable >/dev/null
+fi
+
+mkdir -p "$(dirname "$APP_DIR")"
+REMOTE
+  ok "Server stack ready"
+}
+
+# ------------------------------- git credentials ------------------------------
+configure_git() {
+  [[ -z "$GIT_TOKEN" ]] && return 0
+  step "Storing git credentials on server (for private repo pulls)"
+  remote <<'REMOTE'
+set -euo pipefail
+host=$(echo "$REPO_URL" | sed -E 's#https?://([^/]+)/.*#\1#')
+git config --global credential.helper store
+git config --global --add safe.directory "$APP_DIR"
+umask 077
+printf 'https://%s:%s@%s\n' "$GIT_USER" "$GIT_TOKEN" "$host" > "$HOME/.git-credentials"
+chmod 600 "$HOME/.git-credentials"
+REMOTE
+  ok "Credentials stored at ~/.git-credentials (chmod 600)"
+}
+
+# ------------------------------- deploy (the loop) ----------------------------
+deploy_app() {
+  step "Deploying $APP_NAME ($GIT_BRANCH) -> $APP_DIR"
+  remote <<'REMOTE'
+set -euo pipefail
+
+if [ -d "$APP_DIR/.git" ]; then
+  echo "--- pulling latest"
+  cd "$APP_DIR"
+  git remote set-url origin "$REPO_URL"
+  git fetch --all --prune
+  git checkout "$GIT_BRANCH"
+  git reset --hard "origin/$GIT_BRANCH"
+else
+  echo "--- cloning"
+  ENV_BAK=""
+  if [ -f "$APP_DIR/.env" ]; then ENV_BAK="$(mktemp)"; cp "$APP_DIR/.env" "$ENV_BAK"; fi
+  rm -rf "$APP_DIR"
+  git clone --branch "$GIT_BRANCH" "$REPO_URL" "$APP_DIR"
+  if [ -n "$ENV_BAK" ]; then
+    cp "$ENV_BAK" "$APP_DIR/.env"; chmod 600 "$APP_DIR/.env"; rm -f "$ENV_BAK"
+    echo "--- restored .env after clone"
+  fi
+  cd "$APP_DIR"
+fi
+echo "commit: $(git log -1 --pretty='%h %s')"
+
+cd "$APP_DIR"
+echo "--- installing dependencies"
+eval "$INSTALL_CMD"
+
+BUILD="$BUILD_CMD"
+if [ -z "$BUILD" ] && node -e "const s=require('./package.json').scripts||{};process.exit(s.build?0:1)" 2>/dev/null; then
+  BUILD="npm run build"
+fi
+if [ -n "$BUILD" ]; then
+  if [ -f "$APP_DIR/.env" ]; then
+    echo "--- loading .env into build environment"
+    set -a; . "$APP_DIR/.env"; set +a
+  else
+    echo "--- no .env on server (build runs without it)"
+  fi
+  echo "--- building: $BUILD"
+  NODE_ENV=production eval "$BUILD"
+fi
+
+# wrapper so any start command works with pm2 (npm start, node server.js, etc.)
+cat > "$APP_DIR/.pm2-start.sh" <<EOS
+#!/usr/bin/env bash
+cd "$APP_DIR"
+export NODE_ENV=production
+export PORT="$APP_PORT"
+[ -f "$APP_DIR/.env" ] && set -a && . "$APP_DIR/.env" && set +a
+exec $START_CMD
+EOS
+chmod +x "$APP_DIR/.pm2-start.sh"
+
+cat > "$APP_DIR/ecosystem.config.js" <<EOS
+module.exports = {
+  apps: [{
+    name: "$APP_NAME",
+    script: "$APP_DIR/.pm2-start.sh",
+    interpreter: "bash",
+    cwd: "$APP_DIR",
+    instances: 1,
+    exec_mode: "fork",
+    max_memory_restart: "400M",
+    autorestart: true,
+    env: { NODE_ENV: "production", PORT: "$APP_PORT" }
+  }]
+};
+EOS
+
+echo "--- (re)starting pm2 process"
+pm2 startOrReload "$APP_DIR/ecosystem.config.js" --update-env
+pm2 save >/dev/null
+pm2 describe "$APP_NAME" | grep -E 'status|uptime|restarts' || true
+
+echo "--- health check on 127.0.0.1:$APP_PORT"
+for i in $(seq 1 15); do
+  if curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$APP_PORT/"; then
+    echo "app responded OK"; break
+  fi
+  [ "$i" = "15" ] && { echo "WARNING: no response yet — check: pm2 logs $APP_NAME"; }
+  sleep 2
+done
+REMOTE
+  ok "Deploy finished"
+}
+
+# ------------------------------- nginx ----------------------------------------
+configure_nginx() {
+  step "Configuring nginx reverse proxy"
+  remote <<'REMOTE'
+set -euo pipefail
+SERVER_NAMES="_"
+if [ -n "$DOMAIN" ]; then
+  SERVER_NAMES="$DOMAIN"
+  case "$WWW_ALIAS" in [Yy]*) SERVER_NAMES="$DOMAIN www.$DOMAIN";; esac
+fi
+
+sudo tee "/etc/nginx/sites-available/$APP_NAME" >/dev/null <<EOS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $SERVER_NAMES;
+
+    client_max_body_size 25M;
+
+    location / {
+        proxy_pass         http://127.0.0.1:$APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade \$http_upgrade;
+        proxy_set_header   Connection 'upgrade';
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_read_timeout 300s;
+    }
+}
+EOS
+
+sudo ln -sfn "/etc/nginx/sites-available/$APP_NAME" "/etc/nginx/sites-enabled/$APP_NAME"
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+REMOTE
+  ok "nginx proxying :80 -> 127.0.0.1:$APP_PORT"
+}
+
+# ------------------------------- https ----------------------------------------
+setup_ssl() {
+  [[ -n "$DOMAIN" ]]    || { warn "No domain configured — skipping HTTPS."; return 0; }
+  [[ -n "$SSL_EMAIL" ]] || { warn "No email configured — skipping HTTPS. Run './deploy.sh config' then './deploy.sh ssl'."; return 0; }
+
+  step "Checking DNS for $DOMAIN"
+  local resolved; resolved="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+  if [[ -z "$resolved" ]]; then
+    warn "$DOMAIN does not resolve yet. Point an A record to $SERVER_HOST, wait, then: ./deploy.sh ssl"; return 0
+  elif [[ "$resolved" != "$SERVER_HOST" ]]; then
+    warn "$DOMAIN resolves to $resolved, not $SERVER_HOST. Certbot will likely fail."
+    read -r -p "  Continue anyway? (y/N): " a; [[ "$a" =~ ^[Yy] ]] || return 0
+  else
+    ok "DNS points at this server"
+  fi
+
+  step "Requesting Let's Encrypt certificate"
+  remote <<'REMOTE'
+set -euo pipefail
+ARGS="-d $DOMAIN"
+case "$WWW_ALIAS" in [Yy]*) ARGS="$ARGS -d www.$DOMAIN";; esac
+sudo certbot --nginx $ARGS --non-interactive --agree-tos -m "$SSL_EMAIL" --redirect
+sudo systemctl reload nginx
+sudo systemctl list-timers | grep -i certbot || true
+REMOTE
+  ok "HTTPS live at https://$DOMAIN (auto-renew enabled)"
+}
+
+# ------------------------------- extras ---------------------------------------
+find_env_file() {
+  local f
+  if [[ -n "$ENV_FILE" ]]; then
+    f="${ENV_FILE/#\~/$HOME}"
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+    return 1
+  fi
+  for f in "$SCRIPT_DIR/.env.production" "$SCRIPT_DIR/.env"; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# upload_env [quiet]  — quiet mode skips silently when no file exists
+upload_env() {
+  local quiet="${1:-}" src
+  if ! src="$(find_env_file)"; then
+    [[ "$quiet" == "quiet" ]] && return 0
+    warn "No env file found (looked for \$ENV_FILE, .env.production, .env)."; return 0
+  fi
+
+  if git -C "$SCRIPT_DIR" ls-files --error-unmatch "$src" >/dev/null 2>&1; then
+    warn "$(basename "$src") is tracked by git — secrets are in your repo history."
+  fi
+
+  step "Uploading $(basename "$src") -> $APP_DIR/.env"
+  remote <<'REMOTE'
+mkdir -p "$APP_DIR"
+REMOTE
+  scp "${SSH_OPTS[@]}" "$src" "$SSH_USER@$SERVER_HOST:$APP_DIR/.env" >/dev/null
+  remote <<'REMOTE'
+chmod 600 "$APP_DIR/.env"
+echo "keys on server:"
+grep -oE '^[A-Za-z_][A-Za-z0-9_]*' "$APP_DIR/.env" | sed 's/^/  /' || true
+pm2 restart "$APP_NAME" --update-env >/dev/null 2>&1 || true
+REMOTE
+  ok "Env uploaded (values hidden), app restarted with new environment"
+}
+
+summary() {
+  local url="http://$SERVER_HOST"
+  [[ -n "$DOMAIN" ]] && url="http://$DOMAIN"
+  [[ -n "$DOMAIN" && -n "$SSL_EMAIL" ]] && url="https://$DOMAIN"
+  cat <<EOF
+
+  ${C_G}Done.${C_0}  Your app: ${C_B}$url${C_0}
+
+  Next time you push code, just run:   ${C_B}./deploy.sh deploy${C_0}
+  Other commands: logs | status | restart | ssl | env | ssh | config
+EOF
+}
+
+# ------------------------------- commands -------------------------------------
+cmd_setup() {
+  load_config
+  [[ -f "$CONFIG_FILE" ]] && { read -r -p "  Config found. Reuse saved answers? (Y/n): " a; [[ "$a" =~ ^[Nn] ]] && wizard || true; } || wizard
+  [[ -f "$CONFIG_FILE" ]] || wizard
+  init_ssh; preflight; provision; configure_git; upload_env quiet; deploy_app
+  configure_nginx; setup_ssl; summary
+}
+cmd_deploy()  { load_config; init_ssh; configure_git; upload_env quiet; deploy_app; summary; }
+cmd_ssl()     { load_config; init_ssh; configure_nginx; setup_ssl; }
+cmd_nginx()   { load_config; init_ssh; configure_nginx; }
+cmd_env()     { load_config; init_ssh; upload_env; }
+cmd_config()  { load_config; wizard; }
+cmd_logs()    { load_config; init_ssh; remote_tty "pm2 logs '$APP_NAME' --lines 100"; }
+cmd_restart() { load_config; init_ssh; remote_tty "pm2 restart '$APP_NAME' --update-env && pm2 status"; }
+cmd_ssh()     { load_config; init_ssh; remote_tty "cd '$APP_DIR' 2>/dev/null; exec bash -l"; }
+cmd_status()  {
+  load_config; init_ssh
+  remote <<'REMOTE'
+echo "=== pm2 ==="; pm2 status
+echo; echo "=== nginx ==="; systemctl is-active nginx
+echo; echo "=== disk ==="; df -h / | tail -1
+echo; echo "=== memory ==="; free -h | head -2
+echo; echo "=== last commit ==="; git -C "$APP_DIR" log -1 --pretty='%h %s (%cr)' 2>/dev/null || echo "no repo yet"
+REMOTE
+}
+
+usage() { sed -n '3,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-setup}" in
+  setup)   cmd_setup   ;;
+  deploy)  cmd_deploy  ;;
+  ssl)     cmd_ssl     ;;
+  nginx)   cmd_nginx   ;;
+  env)     cmd_env     ;;
+  config)  cmd_config  ;;
+  logs)    cmd_logs    ;;
+  status)  cmd_status  ;;
+  restart) cmd_restart ;;
+  ssh)     cmd_ssh     ;;
+  -h|--help|help) usage ;;
+  *) die "Unknown command '$1'. Try: ./deploy.sh help" ;;
+esac
