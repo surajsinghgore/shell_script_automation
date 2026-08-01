@@ -6,6 +6,13 @@
 *.sh    text eol=lf
 *.bash  text eol=lf
 
+# GitHub Actions runs these on Linux, and a heredoc inside a workflow carries
+# its line endings straight through to the remote shell — CRLF there fails the
+# same way it does in a .sh file.
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.example text eol=lf
+
 # Docs and config read fine either way, but keeping them LF avoids
 # whole-file diffs whenever they are edited on a different platform.
 *.md         text eol=lf
