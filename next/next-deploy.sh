@@ -148,7 +148,7 @@ save_config() {
 ask() {
   local var="$1" prompt="$2" def="${3:-}" cur ans
   cur="${!var:-}"; [[ -n "$cur" ]] && def="$cur"
-  if [[ -n "$def" ]]; then read -r -p "  $prompt [$def]: " ans; else read -r -p "  $prompt: " ans; fi
+  if [[ -n "$def" ]]; then read -r -e -p "  $prompt [$def]: " ans; else read -r -e -p "  $prompt: " ans; fi
   ans="${ans:-$def}"
   [[ "$ans" == "-" ]] && ans=""      # the only way to clear a saved value
   printf -v "$var" '%s' "$ans"
@@ -577,6 +577,41 @@ fi
 
 echo "--- disk"; df -h / | tail -1
 echo "--- memory"; free -m | awk '/^Mem:/{print "  "$2"MB total, "$7"MB available"}'
+
+# Say no here rather than after a 20-second npm install and a 500MB checkout.
+# MEASURED from real deploys, at the PEAK rather than the steady state.
+# What is still needed depends on what is already on disk: once node_modules
+# exists it is already counted as used, and re-checking as though it had to be
+# downloaded again refuses deploys that would fit perfectly well.
+FREE_MB=$(df -Pm / | awk 'NR==2{print $4}')
+if [ -d "$APP_DIR/node_modules" ]; then
+  NEED_TOTAL=700; KIND="redeploy (node_modules already present)"
+else
+  NEED_TOTAL=1300; KIND="first deploy"
+fi
+if [ "$FREE_MB" -lt "$NEED_TOTAL" ]; then
+  echo
+  echo "ERROR: ${FREE_MB}MB free on / — a ${KIND} needs about ${NEED_TOTAL}MB:"
+  if [ "$NEED_TOTAL" = "1300" ]; then
+    echo "         ~470MB  node_modules"
+    echo "         ~180MB  npm cache growth during install"
+  fi
+  echo "         ~450MB  working room for next build"
+  echo "         ~200MB  .next + the published release"
+  echo "       It settles back to ~660MB afterwards. Nothing was changed."
+  echo
+  echo "       Reclaim space:  sudo du -sh /home/*/apps/* /var/www/* | sort -rh | head"
+  # Resolve the real device: growpart needs the DISK plus a partition number,
+  # not the /dev/root alias, and NVMe names differ from xvd ones.
+  ROOTPART="$(findmnt -no SOURCE / 2>/dev/null || echo /dev/root)"
+  ROOTDISK="$(lsblk -no PKNAME "$ROOTPART" 2>/dev/null | head -1)"
+  PARTNUM="$(printf '%s' "$ROOTPART" | grep -oE '[0-9]+$' || echo 1)"
+  if [ -n "$ROOTDISK" ]; then
+    echo "       Or grow the EBS volume in the AWS console, then on this server:"
+    echo "         sudo growpart /dev/$ROOTDISK $PARTNUM && sudo resize2fs $ROOTPART"
+  fi
+  exit 1
+fi
 exit 0
 REMOTE
   ok "Server stack ready"
@@ -638,6 +673,17 @@ echo "commit: $(git log -1 --pretty='%h %s')"
 echo "--- installing dependencies"
 eval "$INSTALL_CMD"
 
+# npm's cache grows by roughly the size of node_modules during a fresh install
+# (~180MB for a Next.js app) and is pure overhead once the install is done.
+# On a tight disk that growth is the difference between a build finishing and
+# dying halfway, so reclaim it before building rather than after failing.
+FREE_AFTER_INSTALL=$(df -Pm / | awk 'NR==2{print $4}')
+if [ "$FREE_AFTER_INSTALL" -lt 900 ]; then
+  echo "--- ${FREE_AFTER_INSTALL}MB free after install; clearing the npm cache"
+  npm cache clean --force >/dev/null 2>&1 || true
+  echo "    now $(df -Pm / | awk 'NR==2{print $4}')MB free"
+fi
+
 # ---------- 3. build ----------------------------------------------------------
 # Parsed line by line, NOT sourced: a dotenv file legally contains unquoted
 # values with spaces and shell metacharacters, which `.` would try to execute.
@@ -669,15 +715,47 @@ fi
 # A Next.js build is far heavier than a Vite one; without swap it gets OOM-killed
 # on a small instance, surfacing only as a silent "Killed".
 TOTAL_MB=$(free -m | awk '/^Mem:/{print $2}')
-SWAP_MB=$(free -m | awk '/^Swap:/{print $2}')
-if [ "$TOTAL_MB" -lt 4096 ] && [ "$SWAP_MB" -lt 2048 ]; then
-  echo "--- ${TOTAL_MB}MB RAM, ${SWAP_MB}MB swap; ensuring a 3G swapfile for the build"
-  sudo swapoff /swapfile 2>/dev/null || true
-  sudo rm -f /swapfile
-  sudo fallocate -l 3G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=3072 status=none
-  sudo chmod 600 /swapfile; sudo mkswap /swapfile >/dev/null; sudo swapon /swapfile
-  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
-  sudo sysctl -w vm.swappiness=10 >/dev/null
+SWAP_MB=$(free -m  | awk '/^Swap:/{print $2}')
+FREE_MB=$(df -Pm / | awk 'NR==2{print $4}')
+echo "--- ${TOTAL_MB}MB RAM, ${SWAP_MB}MB swap, ${FREE_MB}MB free disk"
+
+# Refuse rather than fill the disk. `next build` writes .next/ plus the release
+# copy; running out mid-build leaves a half-written tree AND a full volume,
+# which takes every other site on the box down with it.
+NEED_MB=500
+if [ "$FREE_MB" -lt "$NEED_MB" ]; then
+  echo "ERROR: only ${FREE_MB}MB free on / — a Next.js build needs about ${NEED_MB}MB."
+  echo "       Nothing has been changed. Free space or grow the volume, then retry:"
+  echo "         du -sh /home/*/apps/* /var/www/*   # what is using it"
+  echo "         ./next-deploy.sh releases <env>    # old releases can be pruned"
+  exit 1
+fi
+
+# Add swap ONLY if there is genuinely too little and the disk can spare it.
+# Never remove working swap first: if the replacement then fails to allocate,
+# the box is left with no swap at all and a full disk.
+if [ "$TOTAL_MB" -lt 4096 ] && [ "$SWAP_MB" -lt 1024 ]; then
+  WANT=2048
+  SPARE=$(( FREE_MB - NEED_MB ))          # never eat the build's headroom
+  [ "$SPARE" -lt "$WANT" ] && WANT="$SPARE"
+  if [ "$WANT" -ge 512 ]; then
+    echo "--- adding a ${WANT}MB swapfile for the build"
+    # A separate name so an existing /swapfile is never clobbered.
+    if sudo fallocate -l "${WANT}M" /swapfile-build 2>/dev/null; then
+      sudo chmod 600 /swapfile-build
+      sudo mkswap /swapfile-build >/dev/null
+      sudo swapon /swapfile-build
+      grep -q '^/swapfile-build' /etc/fstab || echo '/swapfile-build none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+      sudo sysctl -w vm.swappiness=10 >/dev/null
+    else
+      sudo rm -f /swapfile-build
+      echo "    could not allocate it — continuing without extra swap"
+    fi
+  else
+    echo "--- too little free disk to add swap safely; continuing without it"
+  fi
+else
+  echo "--- swap is sufficient (${SWAP_MB}MB)"
 fi
 if [ "$TOTAL_MB" -lt 4096 ]; then
   export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}"
@@ -806,7 +884,10 @@ if [ -n "$DOMAIN" ]; then
 fi
 
 sudo tee "/etc/nginx/sites-available/$APP_NAME" >/dev/null <<EOS
-limit_req_zone \$binary_remote_addr zone=${ZONE}_rl:10m rate=30r/s;
+# Page loads and API calls need very different budgets. One dashboard render can
+# fire 20-30 parallel fetches, which a page-sized limit rejects as an attack.
+limit_req_zone  \$binary_remote_addr zone=${ZONE}_rl:10m  rate=30r/s;
+limit_req_zone  \$binary_remote_addr zone=${ZONE}_api:10m rate=150r/s;
 limit_conn_zone \$binary_remote_addr zone=${ZONE}_cn:10m;
 
 server {
@@ -850,9 +931,30 @@ server {
         access_log off;
     }
 
+    # Route handlers and server actions. Generous limits, and buffering off so
+    # streamed responses (SSE, AI token streams, long polls) reach the client as
+    # they are produced instead of being held back by nginx.
+    location /api/ {
+        limit_req  zone=${ZONE}_api burst=300 nodelay;
+        limit_conn ${ZONE}_cn 100;
+
+        proxy_pass         http://127.0.0.1:$APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade \$http_upgrade;
+        proxy_set_header   Connection 'upgrade';
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
     location / {
         limit_req  zone=${ZONE}_rl burst=60 nodelay;
-        limit_conn ${ZONE}_cn 20;
+        limit_conn ${ZONE}_cn 100;
 
         proxy_pass         http://127.0.0.1:$APP_PORT;
         proxy_http_version 1.1;
@@ -1209,6 +1311,22 @@ usage() { sed -n '3,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 # ------------------------------- dispatch -------------------------------------
 CMD="${1:-setup}"
 ENV_NAME="${2:-${DEPLOY_ENV:-}}"
+
+# Arguments are "<command> <environment>", but "./next-deploy.sh main" reads
+# naturally as "act on main" — so catch that instead of complaining that no
+# environment was named for a command called "main".
+case "$CMD" in
+  setup|deploy|rollback|releases|ssl|nginx|env|config|logs|status|restart|ssh|envs|list|allow-ip|allowip|harden|-h|--help|help) ;;
+  *)
+    if [[ -f "$SCRIPT_DIR/next-deploy.$CMD.conf" ]]; then
+      die "'$CMD' is an environment, not a command. Put the command first:
+       ./next-deploy.sh setup $CMD      provision it
+       ./next-deploy.sh deploy $CMD     build and publish
+       ./next-deploy.sh status $CMD     what is running
+       ./update.sh $CMD                 the usual one"
+    fi
+    ;;
+esac
 
 if [[ "$ENV_NAME" == "all" ]]; then
   all_envs="$(list_envs)"

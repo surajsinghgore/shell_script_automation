@@ -143,12 +143,17 @@ diff -u "$BEFORE" "$ENV_PATH" | sed -n '3,$p' | sed 's/^/  /' || true
 
 # Which KEYS were touched — added, removed or edited on either side. This is
 # what decides between a restart and a rebuild below.
+# `|| true` is load-bearing: diff exits 1 whenever the files differ, which is
+# ALWAYS the case here, and under `set -o pipefail` that non-zero status becomes
+# the assignment's status and `set -e` then kills the script — silently, right
+# after printing the diff. Every grep in the chain can legitimately match
+# nothing too, with the same effect.
 CHANGED_KEYS="$(
   diff "$BEFORE" "$ENV_PATH" 2>/dev/null \
     | grep -E '^[<>]' \
     | sed -E 's/^[<>][[:space:]]*//; s/^export[[:space:]]+//' \
     | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
-    | cut -d= -f1 | sort -u
+    | cut -d= -f1 | sort -u || true
 )"
 rm -f "$BEFORE"
 

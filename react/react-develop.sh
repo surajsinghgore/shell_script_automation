@@ -169,7 +169,7 @@ save_config() {
 ask() {  # ask VAR "Question" ["default"]
   local var="$1" prompt="$2" def="${3:-}" cur ans
   cur="${!var:-}"; [[ -n "$cur" ]] && def="$cur"
-  if [[ -n "$def" ]]; then read -r -p "  $prompt [$def]: " ans; else read -r -p "  $prompt: " ans; fi
+  if [[ -n "$def" ]]; then read -r -e -p "  $prompt [$def]: " ans; else read -r -e -p "  $prompt: " ans; fi
   ans="${ans:-$def}"
   # Enter keeps the saved value, so "-" is the only way to clear one back to
   # empty — without it a wrong answer like API_PROXY_PORT=y can never be undone.
@@ -772,15 +772,31 @@ fi
 # Bundlers are memory hungry. On a 1 GB instance "tsc -b && vite build" gets
 # OOM-killed, which surfaces only as a silent "Killed".
 TOTAL_MB=$(free -m | awk '/^Mem:/{print $2}')
-SWAP_MB=$(free -m | awk '/^Swap:/{print $2}')
-if [ "$TOTAL_MB" -lt 2048 ] && [ "$SWAP_MB" -lt 512 ]; then
+SWAP_MB=$(free -m  | awk '/^Swap:/{print $2}')
+FREE_MB=$(df -Pm / | awk 'NR==2{print $4}')
+
+# Stop before filling the disk — running out mid-build leaves a half-written
+# tree and a full volume, which takes every other site on the box down too.
+if [ "$FREE_MB" -lt 400 ]; then
+  echo "ERROR: only ${FREE_MB}MB free on / — not enough to build safely. Nothing changed."
+  echo "       sudo du -sh /home/*/apps/* /var/www/* | sort -rh | head"
+  exit 1
+fi
+
+# Only add swap if the disk can spare it, and never touch swap that already
+# works: losing it is worse than not upgrading it.
+if [ "$TOTAL_MB" -lt 2048 ] && [ "$SWAP_MB" -lt 512 ] && [ "$FREE_MB" -gt 2600 ]; then
   echo "--- only ${TOTAL_MB}MB RAM and no swap; adding a 2G swapfile for the build"
-  sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
-  sudo chmod 600 /swapfile
-  sudo mkswap /swapfile >/dev/null
-  sudo swapon /swapfile
-  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
-  sudo sysctl -w vm.swappiness=10 >/dev/null
+  if sudo fallocate -l 2G /swapfile 2>/dev/null; then
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile >/dev/null
+    sudo swapon /swapfile
+    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+    sudo sysctl -w vm.swappiness=10 >/dev/null
+  else
+    sudo rm -f /swapfile
+    echo "    could not allocate it — continuing without extra swap"
+  fi
 fi
 if [ "$TOTAL_MB" -lt 2048 ]; then
   export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=1536}"
