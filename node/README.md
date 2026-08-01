@@ -87,6 +87,37 @@ Answer **2**. Ports auto-increment and are checked for clashes.
 | Install command | `npm ci \|\| npm install` | keep dev deps — TS/build tooling lives there |
 | Build command | *blank*, or `npm run build` | blank is fine; plain JS APIs have no build |
 | **Start command** | `npm start`, `node server.js`, `node dist/main.js` | what pm2 actually runs |
+| **Static folder** | `public`, or blank | see below — set it if your app renders EJS/Pug |
+
+### If your Express app also serves a frontend
+
+A classic Express app renders **EJS / Pug / Handlebars** views *and* serves css,
+images and client JS from `public/`. Both work here.
+
+- **Views are rendered by your app**, and nginx proxies to it. Nothing to
+  configure.
+- **Static files** work either way, but naming the folder at setup lets nginx
+  serve them **straight off disk** instead of through `express.static()`:
+
+```
+Static folder, e.g. public ('-' = none, app serves everything): public
+```
+
+That produces `try_files $uri @app` — if the file exists under `public/`, nginx
+sends it with cache headers and no logging; anything else falls through to your
+app, so dynamic routes are unaffected.
+
+Why bother:
+
+| | via `express.static()` | via nginx |
+|---|---|---|
+| Cache headers | none by default | `expires 7d` |
+| Who serves it | your event loop | nginx |
+| Access log noise | every image | off |
+
+**Your templates are never exposed.** Views live in `views/`, not `public/`, so
+nginx has no path to them. Leave the folder blank and every request goes to your
+app, which is correct for a pure JSON API.
 
 > Budget roughly **150 MB RAM and 320 MB disk** per environment.
 
@@ -317,11 +348,14 @@ The newest **3** releases are kept.
 
 ## nginx
 
-Every path is proxied to the app — a backend has no static assets and no page
-routes, so there is nothing to special-case. One generous rate budget
-(150 r/s, burst 300) because a single frontend page can fire 20–30 parallel
-calls, and `proxy_buffering off` so streamed responses and downloads reach the
-client as they are produced.
+One generous rate budget (150 r/s, burst 300), because a single page can fire
+20–30 parallel calls and a page-sized limit would reject that as an attack.
+`proxy_buffering off` so streamed responses and downloads reach the client as
+they are produced.
+
+If **Static folder** is set, nginx serves those files itself
+(`try_files $uri @app`) and only the misses reach your app. If it is blank,
+every request is proxied — correct for a pure JSON API.
 
 ## Differences from the frontend toolchains
 

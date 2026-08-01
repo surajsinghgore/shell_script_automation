@@ -112,6 +112,9 @@ WEB_ROOT=""          # /var/www/<APP_NAME>            — releases + current
 APP_PORT="3000"      # MUST be unique per environment
 INSTALL_CMD="npm ci || npm install"   # keep dev deps: TS/build tooling lives there
 START_CMD="npm start"                 # what pm2 runs: npm start, node server.js, ...
+STATIC_DIR=""                         # e.g. "public" — let nginx serve those files
+                                      # directly instead of express.static().
+                                      # Blank = every request goes to the app.
 BUILD_CMD=""                          # blank = skip; many APIs have no build step
 ENV_FILE=""
 DOMAIN=""
@@ -126,7 +129,7 @@ ENV_LABEL=""
 
 CONFIG_KEYS=(PEM_PATH SERVER_HOST SSH_USER NODE_MAJOR REPO_URL REPO_PRIVATE GIT_USER
              GIT_TOKEN GIT_BRANCH APP_NAME APP_DIR WEB_ROOT APP_PORT INSTALL_CMD
-             BUILD_CMD START_CMD ENV_FILE DOMAIN WWW_ALIAS SSL_EMAIL SETUP_FIREWALL SG_ID
+             BUILD_CMD START_CMD STATIC_DIR ENV_FILE DOMAIN WWW_ALIAS SSL_EMAIL SETUP_FIREWALL SG_ID
              AWS_REGION KEEP_RELEASES MAX_MEMORY ENV_LABEL)
 
 load_config() { [[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE" || true; }
@@ -353,6 +356,9 @@ BANNER
   ask INSTALL_CMD "Install command (must include devDependencies)"
   ask BUILD_CMD   "Build command (blank = none, e.g. tsc for a TypeScript API)"
   ask START_CMD   "Start command pm2 runs (npm start | node server.js | node dist/main.js)"
+  note "If this app renders EJS/Pug views AND serves css/images from a folder,"
+  note "name that folder and nginx will serve those files instead of your app."
+  ask STATIC_DIR  "Static folder, e.g. public ('-' = none, app serves everything)"
   ask_env_file    "Local env file to upload (blank = auto-detect .env.${ENV_LABEL:-production} / .env)"
   APP_DIR="/home/$SSH_USER/apps/$APP_NAME"
   [[ "$SSH_USER" == "root" ]] && APP_DIR="/root/apps/$APP_NAME"
@@ -882,6 +888,39 @@ configure_nginx() {
 set -euo pipefail
 SERVER_NAMES="_"
 ZONE="$(printf '%s' "$APP_NAME" | tr -c 'a-zA-Z0-9' '_' | cut -c1-24)"
+
+# A classic Express app (EJS/Pug views + express.static) serves its css, images
+# and client JS from a folder — usually public/. Those are files on disk, and
+# nginx serves them far faster than Node can, with cache headers Express does
+# not set by default.
+#
+# `try_files $uri @app` means: if the file exists under that folder, send it;
+# otherwise hand the request to the app. Views live in views/, not public/, so
+# templates are never exposed as files.
+# Written with a QUOTED heredoc so nginx's own $variables survive verbatim; the
+# paths are substituted afterwards. An unquoted one turns \$uri into a literal
+# backslash-dollar, which nginx treats as a filename rather than a variable.
+STATIC_BLOCK=""
+APP_LOCATION="/"
+if [ -n "${STATIC_DIR:-}" ]; then
+  APP_LOCATION="@app"
+  STATIC_BLOCK=$(cat <<'EOB'
+    # Served straight off disk; anything not found there falls through to the
+    # app, so dynamic routes still work. No rate limit: assets are cheap, and a
+    # single page pulls dozens of them.
+    root __WEB_ROOT__/current/__STATIC_DIR__;
+
+    location / {
+        try_files $uri @app;
+        expires 7d;
+        add_header Cache-Control "public";
+        access_log off;
+    }
+EOB
+)
+  STATIC_BLOCK="${STATIC_BLOCK//__WEB_ROOT__/$WEB_ROOT}"
+  STATIC_BLOCK="${STATIC_BLOCK//__STATIC_DIR__/$STATIC_DIR}"
+fi
 if [ -n "$DOMAIN" ]; then
   SERVER_NAMES="$DOMAIN"
   case "$WWW_ALIAS" in [Yy]*) SERVER_NAMES="$DOMAIN www.$DOMAIN";; esac
@@ -916,12 +955,13 @@ server {
 
     location ~ /\.(?!well-known) { deny all; }
 
-    # A backend serves no static assets and has no page routes — every path is an
-    # API call. So there is nothing to special-case here, and the whole server
-    # gets the generous budget that only /api/ needed in the frontend configs.
-    # proxy_buffering is off so streamed responses (SSE, downloads, long polls)
-    # reach the client as they are produced.
-    location / {
+    # One generous budget: a single page can fire 20-30 parallel calls, which a
+    # page-sized limit would reject as an attack. proxy_buffering is off so
+    # streamed responses (SSE, downloads, long polls) reach the client as they
+    # are produced. If STATIC_DIR is set, nginx serves those files itself and
+    # only the misses arrive here.
+$STATIC_BLOCK
+    location $APP_LOCATION {
         limit_req  zone=${ZONE}_api burst=300 nodelay;
         limit_conn ${ZONE}_cn 100;
 
